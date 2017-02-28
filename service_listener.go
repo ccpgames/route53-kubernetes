@@ -4,6 +4,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"time"
@@ -15,12 +16,12 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/elb"
 	"github.com/aws/aws-sdk-go/service/route53"
-	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/client/restclient"
-	"k8s.io/kubernetes/pkg/client/transport"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
-	"k8s.io/kubernetes/pkg/labels"
+
+	"k8s.io/client-go/1.5/kubernetes"
+	"k8s.io/client-go/1.5/pkg/api"
+	"k8s.io/client-go/1.5/pkg/api/v1"
+	"k8s.io/client-go/1.5/pkg/labels"
+	"k8s.io/client-go/1.5/rest"
 )
 
 // Don't actually commit the changes to route53 records, just print out what we would have done.
@@ -35,49 +36,14 @@ func init() {
 
 func main() {
 	flag.Parse()
-	glog.Info("Route53 Update Service")
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	log.Println("Route53 Update Service")
 
-	config, err := restclient.InClusterConfig()
+	clientset, err := getClientset()
 	if err != nil {
-		kubernetesService := os.Getenv("KUBERNETES_SERVICE_HOST")
-		kubernetesServicePort := os.Getenv("KUBERNETES_SERVICE_PORT")
-		if kubernetesService == "" {
-			glog.Fatal("Please specify the Kubernetes server via KUBERNETES_SERVICE_HOST")
-		}
-		if kubernetesServicePort == "" {
-			kubernetesServicePort = "443"
-		}
-		apiServer := fmt.Sprintf("https://%s:%s", kubernetesService, kubernetesServicePort)
-
-		caFilePath := os.Getenv("CA_FILE_PATH")
-		certFilePath := os.Getenv("CERT_FILE_PATH")
-		keyFilePath := os.Getenv("KEY_FILE_PATH")
-		if caFilePath == "" || certFilePath == "" || keyFilePath == "" {
-			glog.Fatal("You must provide paths for CA, Cert, and Key files")
-		}
-
-		tls := transport.TLSConfig{
-			CAFile:   caFilePath,
-			CertFile: certFilePath,
-			KeyFile:  keyFilePath,
-		}
-		// tlsTransport := transport.New(transport.Config{TLS: tls})
-		tlsTransport, err := transport.New(&transport.Config{TLS: tls})
-		if err != nil {
-			glog.Fatalf("Couldn't set up tls transport: %s", err)
-		}
-
-		config = &restclient.Config{
-			Host:      apiServer,
-			Transport: tlsTransport,
-		}
+		// we only support in-cluster mode currently
+		panic(fmt.Sprintf("failed to connect to kubernetes using on-cluster config: %s", err))
 	}
-
-	c, err := client.New(config)
-	if err != nil {
-		glog.Fatalf("Failed to make client: %v", err)
-	}
-	glog.Infof("Connected to kubernetes @ %s", config.Host)
 
 	metadata := ec2metadata.New(session.New())
 
@@ -90,7 +56,7 @@ func main() {
 
 	region, err := metadata.Region()
 	if err != nil {
-		glog.Fatalf("Unable to retrieve the region from the EC2 instance %v\n", err)
+		panic(fmt.Sprintf("Unable to retrieve the region from the EC2 instance %v\n", err))
 	}
 
 	awsConfig := aws.NewConfig()
@@ -101,44 +67,44 @@ func main() {
 	r53Api := route53.New(sess)
 	elbAPI := elb.New(sess)
 	if r53Api == nil || elbAPI == nil {
-		glog.Fatal("Failed to make AWS connection")
+		panic("Failed to make AWS connection")
 	}
 
 	selector := "dns=route53"
 	l, err := labels.Parse(selector)
 	if err != nil {
-		glog.Fatalf("Failed to parse selector %q: %v", selector, err)
+		panic(fmt.Sprintf("Failed to parse selector %q: %v", selector, err))
 	}
 	listOptions := api.ListOptions{
 		LabelSelector: l,
 	}
 
-	glog.Infof("Starting Service Polling every 30s")
+	log.Println("Starting Service Polling every 30s")
 	awsCallFailed := false
 	for {
 		if awsCallFailed {
-			glog.Info("Noticed failed calls to AWS services, refreshing creds")
+			log.Println("Noticed failed calls to AWS services, refreshing creds")
 			sess.Config.Credentials.Expire()
 			awsCallFailed = false
 		}
 
-		services, err := c.Services(api.NamespaceAll).List(listOptions)
+		services, err := clientset.Services(api.NamespaceAll).List(listOptions)
 		if err != nil {
-			glog.Fatalf("Failed to list pods: %v", err)
+			panic(fmt.Sprintf("Failed to list pods: %v", err))
 		}
 
-		glog.Infof("Found %d DNS services in all namespaces with selector %q", len(services.Items), selector)
+		log.Printf("Found %d DNS services in all namespaces with selector %q\n", len(services.Items), selector)
 		for i := range services.Items {
 			s := &services.Items[i]
 			hn, err := serviceHostname(s)
 			if err != nil {
-				glog.Warningf("Couldn't find hostname for %s: %s", s.Name, err)
+				log.Println("warning! Couldn't find hostname for", s.Name, err)
 				continue
 			}
 
 			annotation, ok := s.ObjectMeta.Annotations["domainName"]
 			if !ok {
-				glog.Warningf("Domain name not set for %s", s.Name)
+				log.Println("warning! Domain name not set for", s.Name)
 				continue
 			}
 
@@ -146,17 +112,17 @@ func main() {
 			for j := range domains {
 				domain := domains[j]
 
-				glog.Infof("Creating DNS for %s service: %s -> %s", s.Name, hn, domain)
+				log.Printf("Creating DNS for %s service: %s -> %s\n", s.Name, hn, domain)
 				elbZoneID, err := hostedZoneID(elbAPI, hn)
 				if err != nil {
-					glog.Warningf("Couldn't get zone ID: %s", err)
+					log.Println("warning! Couldn't get zone ID:", err)
 					awsCallFailed = true
 					continue
 				}
 
 				zone, err := getDestinationZone(domain, r53Api)
 				if err != nil {
-					glog.Warningf("Couldn't find destination zone: %s", err)
+					log.Println("warning! Couldn't find destination zone:", err)
 					awsCallFailed = true
 					continue
 				}
@@ -166,15 +132,29 @@ func main() {
 				zoneID = zoneParts[len(zoneParts)-1]
 
 				if err = updateDNS(r53Api, hn, elbZoneID, strings.TrimLeft(domain, "."), zoneID); err != nil {
-					glog.Warning(err)
+					log.Println("warning!", err)
 					awsCallFailed = true
 					continue
 				}
-				glog.Infof("Created dns record set: domain=%s, zoneID=%s", domain, zoneID)
+				log.Printf("Created dns record set: domain=%s, zoneID=%s\n", domain, zoneID)
 			}
 		}
 		time.Sleep(30 * time.Second)
 	}
+}
+
+func getClientset() (*kubernetes.Clientset, error) {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+
+	return clientset, nil
 }
 
 func getDestinationZone(domain string, r53Api *route53.Route53) (*route53.HostedZone, error) {
@@ -236,7 +216,7 @@ func domainWithTrailingDot(withoutDot string) string {
 	return fmt.Sprint(withoutDot, ".")
 }
 
-func serviceHostname(service *api.Service) (string, error) {
+func serviceHostname(service *v1.Service) (string, error) {
 	ingress := service.Status.LoadBalancer.Ingress
 	if len(ingress) < 1 {
 		return "", errors.New("No ingress defined for ELB")
@@ -311,7 +291,7 @@ func updateDNS(r53Api *route53.Route53, hn, hzID, domain, zoneID string) error {
 		HostedZoneId: &zoneID,
 	}
 	if dryRun {
-		glog.Infof("DRY RUN: We normally would have updated %s to point to %s (%s)", zoneID, hzID, hn)
+		log.Printf("DRY RUN: We normally would have updated %s to point to %s (%s)\n", zoneID, hzID, hn)
 		return nil
 	}
 
